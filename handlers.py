@@ -58,9 +58,7 @@ async def init_pyro_client(api_id: int, api_hash: str,
         me = await _pyro_client.get_me()
         log.info("✅ Pyrogram started as: %s", me.first_name)
 
-    except Exception as e:
-        log.error("❌ Pyrogram failed to start: %s", e)
-        _pyro_client = None
+    
 
 
 async def stop_pyro_client():
@@ -89,7 +87,27 @@ def _build_caption(template: str, **kwargs) -> str:
         return kwargs.get("newname", kwargs.get("filename", ""))
 
 
-def _get_media(message):
+def _get_media(await _pyro_client.start()
+        me = await _pyro_client.get_me()
+        log.info("✅ Pyrogram started as: %s", me.first_name)
+
+        # Warm up all channel peers from DB
+        from database import all_users
+        users = await all_users()
+        for u in users:
+            for ch in (u.get("source_channels") or []):
+                try:
+                    await _pyro_client.get_chat(int(ch))
+                    log.info("✅ Peer cached: %s", ch)
+                except Exception as ex:
+                    log.warning("Peer cache failed %s: %s", ch, ex)
+            dest = u.get("dest_channel")
+            if dest:
+                try:
+                    await _pyro_client.get_chat(int(dest))
+                    log.info("✅ Peer cached dest: %s", dest)
+                except Exception as ex:
+                    log.warning("Peer cache failed dest %s: %s", dest, ex)message):
     return (
         message.document
         or message.video
