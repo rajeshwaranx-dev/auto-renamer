@@ -1,18 +1,5 @@
 """
 LeechBot — Main Entry Point
-============================
-Downloads files from source channels, embeds thumbnail + metadata,
-renames with prefix, uploads to destination channel.
-
-Usage:
-  python3 main.py
-
-Required env vars (in .env):
-  BOT_TOKEN      Telegram bot token
-  ADMIN_IDS      Comma-separated admin IDs
-  MONGO_URL      MongoDB connection string
-  MONGO_DB_NAME  MongoDB DB name (default: leech_bot)
-  DOWNLOAD_DIR   Temp dir (default: /tmp/leech)
 """
 
 import atexit
@@ -31,7 +18,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import BOT_TOKEN, ADMIN_IDS, MONGO_URL, DOWNLOAD_DIR, log
+from config import BOT_TOKEN, ADMIN_IDS, MONGO_URL, DOWNLOAD_DIR, API_ID, API_HASH, SESSION_STRING, log
 from database import all_users
 import state
 
@@ -50,12 +37,8 @@ from commands_user import (
     setcaption_command, resetcaption_command,
     setthumb_command, removethumb_command,
 )
-from handlers import handle_channel_post, handle_thumb_photo
+from handlers import handle_channel_post, handle_thumb_photo, init_pyro_client, stop_pyro_client
 
-
-# ══════════════════════════════════════════════════════════════
-# SYNC NOTIFIER
-# ══════════════════════════════════════════════════════════════
 
 def _sync_notify(text: str):
     if not BOT_TOKEN or not ADMIN_IDS:
@@ -77,18 +60,26 @@ def _offline_msg(reason: str, extra: str = "") -> str:
         f"🕐 Time: {now} UTC\n"
         f"❗ Reason: <b>{reason}</b>\n"
         f"📦 Session posts: {state.stats.get('total', 0)}\n"
-        f"{('📋 ' + extra + '\n') if extra else ''}"
+        f"{('📋 ' + extra + chr(10)) if extra else ''}"
         f"Restart: <code>systemctl restart leechbot</code>"
     )
 
 
-# ══════════════════════════════════════════════════════════════
-# STARTUP / SHUTDOWN
-# ══════════════════════════════════════════════════════════════
-
 async def on_startup(app):
     state.bot_app = app
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+    # Start Pyrogram client for large file downloads
+    if API_ID and API_HASH:
+        await init_pyro_client(
+            api_id         = API_ID,
+            api_hash       = API_HASH,
+            session_string = SESSION_STRING,
+            bot_token      = BOT_TOKEN if not SESSION_STRING else "",
+        )
+    else:
+        log.warning("⚠️  API_ID/API_HASH not set — large file download disabled")
+
     users  = await all_users()
     active = [u for u in users if u.get("active")]
     now    = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -105,13 +96,10 @@ async def on_startup(app):
 async def on_shutdown(app=None):
     global _notified_offline
     _notified_offline = True
+    await stop_pyro_client()
     _sync_notify(_offline_msg("Graceful Shutdown"))
     log.info("⚠️ LeechBot shutting down.")
 
-
-# ══════════════════════════════════════════════════════════════
-# SIGNAL / CRASH HANDLERS
-# ══════════════════════════════════════════════════════════════
 
 _signal_names = {
     signal.SIGTERM: "SIGTERM (systemctl stop)",
@@ -143,7 +131,6 @@ def _excepthook(exc_type, exc_value, exc_tb):
     _orig_excepthook(exc_type, exc_value, exc_tb)
 
 sys.excepthook = _excepthook
-
 _notified_offline = False
 
 def _atexit():
@@ -156,10 +143,6 @@ def _atexit():
 atexit.register(_atexit)
 
 
-# ══════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
     if not BOT_TOKEN:
         log.error("BOT_TOKEN is not set. Exiting.")
@@ -168,25 +151,24 @@ if __name__ == "__main__":
         log.warning("⚠️  MONGO_URL not set — configs will not persist!")
     if not ADMIN_IDS:
         log.warning("⚠️  ADMIN_IDS not set — all commands are unrestricted!")
+    if not API_ID or not API_HASH:
+        log.warning("⚠️  API_ID/API_HASH not set — only files under 20MB will work!")
 
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(on_startup)
         .post_shutdown(on_shutdown)
-        .read_timeout(300)        # 5 min — for large file downloads
-        .write_timeout(300)       # 5 min — for large file uploads
+        .read_timeout(600)
+        .write_timeout(600)
         .connect_timeout(60)
-        .pool_timeout(300)
+        .pool_timeout(600)
         .build()
     )
     state.bot_app = app
 
-    # ── General ────────────────────────────────────────────────
     app.add_handler(CommandHandler("start",         start_command))
     app.add_handler(CommandHandler("commands",      commands_command))
-
-    # ── Admin ──────────────────────────────────────────────────
     app.add_handler(CommandHandler("adduser",       adduser_command))
     app.add_handler(CommandHandler("removeuser",    removeuser_command))
     app.add_handler(CommandHandler("listusers",     listusers_command))
@@ -194,8 +176,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("toggleuser",    toggleuser_command))
     app.add_handler(CommandHandler("stats",         stats_command))
     app.add_handler(CommandHandler("broadcast",     broadcast_command))
-
-    # ── User config ────────────────────────────────────────────
     app.add_handler(CommandHandler("myinfo",        myinfo_command))
     app.add_handler(CommandHandler("setsource",     setsource_command))
     app.add_handler(CommandHandler("removesource",  removesource_command))
@@ -207,13 +187,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("setthumb",      setthumb_command))
     app.add_handler(CommandHandler("removethumb",   removethumb_command))
 
-    # ── Thumbnail photo capture ────────────────────────────────
     app.add_handler(MessageHandler(
         filters.PHOTO & filters.ChatType.PRIVATE,
         handle_thumb_photo,
     ))
-
-    # ── Channel post listener ──────────────────────────────────
     app.add_handler(MessageHandler(
         filters.ChatType.CHANNEL & ~filters.UpdateType.EDITED,
         handle_channel_post,
