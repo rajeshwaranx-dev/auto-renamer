@@ -166,15 +166,12 @@ async def _pyro_upload(pyro: PyroClient, message,
 
     if ext in VIDEO_EXTS or message.video:
         await pyro.send_video(
-            chat_id   = dest_channel,
-            video     = file_path,
-            caption   = caption,
-            file_name = new_name,
-            thumb     = thumb,
+            chat_id            = dest_channel,
+            video              = file_path,
+            caption            = caption,
+            file_name          = new_name,
+            thumb              = thumb,
             supports_streaming = True,
-            duration  = getattr(getattr(message, "video", None), "duration", None),
-            width     = getattr(getattr(message, "video", None), "width", None),
-            height    = getattr(getattr(message, "video", None), "height", None),
         )
     elif ext in AUDIO_EXTS or message.audio:
         await pyro.send_audio(
