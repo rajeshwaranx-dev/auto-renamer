@@ -1,0 +1,17 @@
+[Unit]
+Description=LeechBot - Telegram Auto Rename & Leech Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/leech_bot
+EnvironmentFile=/root/leech_bot/.env
+ExecStart=/usr/bin/python3 main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
