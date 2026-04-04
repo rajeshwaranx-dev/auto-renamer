@@ -1,21 +1,11 @@
 """
-handlers.py — Core leech handler.
-
-Downloads via Pyrogram (no file size limit).
-Uploads via PTB bot (up to 2GB).
-
-Flow:
-  1. PTB detects file in source channel
-  2. Pyrogram client downloads file to /tmp/leech/
-  3. ffmpeg embeds thumbnail + metadata
-  4. PTB uploads to destination channel
-  5. Temp files deleted
+handlers.py — Leech handler.
+Download via Pyrogram + Upload via Pyrogram (no size limits).
 """
 
 import os
-import asyncio
-
 from pyrogram import Client as PyroClient
+from pyrogram.types import Message as PyroMessage
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
@@ -25,7 +15,6 @@ from config import DOWNLOAD_DIR, log
 from database import users_for_source, increment_stats, update_user
 from ffmpeg_utils import embed_metadata, extract_thumb_from_video, human_size, is_video
 import state
-
 
 # ──────────────────────────────────────────────────────────────
 # PYROGRAM CLIENT
@@ -43,12 +32,6 @@ async def get_pyro_client() -> PyroClient | None:
 
 async def init_pyro_client(api_id: int, api_hash: str,
                             session_string: str = "", bot_token: str = ""):
-    """
-    Initialize Pyrogram client.
-    session_string = user session (4GB support)
-    bot_token      = bot session (same bot, better download than PTB)
-    Called from on_startup in main.py
-    """
     global _pyro_client
     try:
         if session_string:
@@ -68,7 +51,7 @@ async def init_pyro_client(api_id: int, api_hash: str,
                 in_memory=True,
             )
         else:
-            log.warning("⚠️  No Pyrogram session configured — large file download disabled")
+            log.warning("⚠️  No Pyrogram credentials — large file support disabled")
             return
 
         await _pyro_client.start()
@@ -139,7 +122,7 @@ async def _pyro_download(chat_id: int, message_id: int, dest_path: str) -> bool:
         log.error("❌ Pyrogram client not available")
         return False
     try:
-        log.info("⬇️  Pyrogram downloading → %s", os.path.basename(dest_path))
+        log.info("⬇️  Downloading → %s", os.path.basename(dest_path))
         msg = await pyro.get_messages(chat_id, message_id)
         await pyro.download_media(msg, file_name=dest_path)
         size = os.path.getsize(dest_path)
@@ -147,12 +130,12 @@ async def _pyro_download(chat_id: int, message_id: int, dest_path: str) -> bool:
         log.info("⬇️  Downloaded: %s (%s)", os.path.basename(dest_path), human_size(size))
         return True
     except Exception as e:
-        log.error("❌ Pyrogram download failed: %s", e)
+        log.error("❌ Download failed: %s", e)
         return False
 
 
 # ──────────────────────────────────────────────────────────────
-# DOWNLOAD thumbnail via PTB
+# DOWNLOAD thumbnail via PTB (thumbnails are small, PTB is fine)
 # ──────────────────────────────────────────────────────────────
 
 async def _download_thumb(bot, file_id: str, dest_path: str) -> bool:
@@ -166,54 +149,52 @@ async def _download_thumb(bot, file_id: str, dest_path: str) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────
-# UPLOAD via PTB
+# UPLOAD via Pyrogram (no size limit!)
 # ──────────────────────────────────────────────────────────────
 
-async def _upload_file(bot, message, dest_channel: str,
-                       file_path: str, new_name: str,
-                       caption: str, thumb_path: str | None):
-    size       = os.path.getsize(file_path)
-    thumb_file = open(thumb_path, "rb") if thumb_path and os.path.exists(thumb_path) else None
+async def _pyro_upload(pyro: PyroClient, message,
+                       dest_channel: str, file_path: str,
+                       new_name: str, caption: str,
+                       thumb_path: str | None):
+    """Upload file to destination channel via Pyrogram."""
+    size = os.path.getsize(file_path)
+    ext  = os.path.splitext(file_path)[1].lower()
+    thumb = thumb_path if thumb_path and os.path.exists(thumb_path) else None
 
-    try:
-        with open(file_path, "rb") as f:
-            if message.video:
-                video = message.video
-                await bot.send_video(
-                    chat_id            = dest_channel,
-                    video              = f,
-                    filename           = new_name,
-                    caption            = caption,
-                    parse_mode         = ParseMode.HTML,
-                    thumbnail          = thumb_file,
-                    duration           = getattr(video, "duration", None),
-                    width              = getattr(video, "width", None),
-                    height             = getattr(video, "height", None),
-                    supports_streaming = True,
-                )
-            elif message.audio:
-                await bot.send_audio(
-                    chat_id    = dest_channel,
-                    audio      = f,
-                    filename   = new_name,
-                    title      = new_name,
-                    caption    = caption,
-                    parse_mode = ParseMode.HTML,
-                    thumbnail  = thumb_file,
-                    duration   = getattr(message.audio, "duration", None),
-                )
-            else:
-                await bot.send_document(
-                    chat_id    = dest_channel,
-                    document   = f,
-                    filename   = new_name,
-                    caption    = caption,
-                    parse_mode = ParseMode.HTML,
-                    thumbnail  = thumb_file,
-                )
-    finally:
-        if thumb_file:
-            thumb_file.close()
+    VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".ts", ".m4v"}
+    AUDIO_EXTS = {".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wav"}
+
+    if ext in VIDEO_EXTS or message.video:
+        await pyro.send_video(
+            chat_id   = dest_channel,
+            video     = file_path,
+            caption   = caption,
+            file_name = new_name,
+            thumb     = thumb,
+            supports_streaming = True,
+            duration  = getattr(getattr(message, "video", None), "duration", None),
+            width     = getattr(getattr(message, "video", None), "width", None),
+            height    = getattr(getattr(message, "video", None), "height", None),
+        )
+    elif ext in AUDIO_EXTS or message.audio:
+        await pyro.send_audio(
+            chat_id   = dest_channel,
+            audio     = file_path,
+            caption   = caption,
+            file_name = new_name,
+            thumb     = thumb,
+            title     = new_name,
+            duration  = getattr(getattr(message, "audio", None), "duration", None),
+        )
+    else:
+        await pyro.send_document(
+            chat_id   = dest_channel,
+            document  = file_path,
+            caption   = caption,
+            file_name = new_name,
+            thumb     = thumb,
+            force_document = True,
+        )
 
     state.stats["uploaded"] += size
     log.info("⬆️  Uploaded: %s (%s)", new_name, human_size(size))
@@ -239,6 +220,11 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     _ensure_dir()
 
+    pyro = await get_pyro_client()
+    if not pyro:
+        log.error("❌ Pyrogram not available — cannot process files")
+        return
+
     for user in matched:
         dest = user.get("dest_channel")
         if not dest:
@@ -259,17 +245,16 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         state.active_tasks[uid] = state.active_tasks.get(uid, 0) + 1
 
         try:
-            # ── 1. Download via Pyrogram ───────────────────────
+            # 1. Download
             log.info("⬇️  Downloading | user=%s | %s (%s)",
                      user["name"], original_name, human_size(file_size))
-
             ok = await _pyro_download(message.chat.id, message.message_id, dl_path)
             if not ok:
                 await increment_stats(uid, failed=True)
                 state.stats["failed"] += 1
                 continue
 
-            # ── 2. Get thumbnail ───────────────────────────────
+            # 2. Thumbnail
             thumb_file_id = user.get("thumb")
             if thumb_file_id:
                 thumb_dl_path = dl_path + "_thumb.jpg"
@@ -277,7 +262,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             elif is_video(dl_path):
                 thumb_dl_path = await extract_thumb_from_video(dl_path)
 
-            # ── 3. ffmpeg embed ────────────────────────────────
+            # 3. ffmpeg embed
             log.info("⚙️  Embedding metadata | user=%s", user["name"])
             processed_path = await embed_metadata(
                 input_path = dl_path,
@@ -285,7 +270,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 title      = new_name,
             )
 
-            # ── 4. Build caption ───────────────────────────────
+            # 4. Caption
             caption_tpl = user.get("caption_template") or "<b>{newname}</b>"
             caption = _build_caption(
                 caption_tpl,
@@ -297,10 +282,10 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 size     = human_size(file_size),
             )
 
-            # ── 5. Upload ──────────────────────────────────────
+            # 5. Upload via Pyrogram
             log.info("⬆️  Uploading | user=%s | %s", user["name"], new_name)
-            await _upload_file(
-                bot          = context.bot,
+            await _pyro_upload(
+                pyro         = pyro,
                 message      = message,
                 dest_channel = dest,
                 file_path    = processed_path,
@@ -309,18 +294,13 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 thumb_path   = thumb_dl_path,
             )
 
-            # ── 6. Stats ───────────────────────────────────────
+            # 6. Stats
             await increment_stats(uid)
             state.stats["total"] += 1
             state.stats["by_user"][user["name"]] = (
                 state.stats["by_user"].get(user["name"], 0) + 1
             )
             log.info("✅ Done | user=%s | %s → %s", user["name"], original_name, new_name)
-
-        except TelegramError as exc:
-            log.error("❌ TelegramError | user=%s: %s", user["name"], exc)
-            await increment_stats(uid, failed=True)
-            state.stats["failed"] += 1
 
         except Exception as exc:
             log.error("❌ Error | user=%s: %s", user["name"], exc)
@@ -355,3 +335,4 @@ async def handle_thumb_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode=ParseMode.HTML,
     )
     log.info("Thumbnail saved for user_id=%s", user_id)
+  
