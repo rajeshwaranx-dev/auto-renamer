@@ -107,16 +107,37 @@ async def _download_thumb(bot, file_id, dest_path):
 
 async def _pyro_upload(pyro, message, dest_channel, file_path, new_name, caption, thumb_path):
     size = os.path.getsize(file_path)
+async def _pyro_upload(pyro, message, dest_channel, file_path, new_name, caption, thumb_path):
+    size = os.path.getsize(file_path)
     ext  = os.path.splitext(file_path)[1].lower()
     thumb = thumb_path if thumb_path and os.path.exists(thumb_path) else None
-    VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".ts", ".m4v"}
-    AUDIO_EXTS = {".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wav"}
-    if ext in VIDEO_EXTS or message.video:
-        await pyro.send_video(chat_id=dest_channel, video=file_path, caption=caption, file_name=new_name, thumb=thumb, supports_streaming=True)
-    elif ext in AUDIO_EXTS or message.audio:
-        await pyro.send_audio(chat_id=dest_channel, audio=file_path, caption=caption, file_name=new_name, thumb=thumb, title=new_name)
+    STREAM_EXTS = {".mp4", ".m4v"}   # only mp4 streams natively in Telegram
+
+    if ext in STREAM_EXTS:
+        # Get duration via ffprobe
+        import asyncio
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", file_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        try:
+            duration = int(float(stdout.decode().strip()))
+        except Exception:
+            duration = 0
+        await pyro.send_video(
+            chat_id=dest_channel, video=file_path, caption=caption,
+            file_name=new_name, thumb=thumb, supports_streaming=True,
+            duration=duration
+        )
     else:
-        await pyro.send_document(chat_id=dest_channel, document=file_path, caption=caption, file_name=new_name, thumb=thumb, force_document=True)
+        # mkv, avi etc — send as document with thumbnail (standard for movie bots)
+        await pyro.send_document(
+            chat_id=dest_channel, document=file_path, caption=caption,
+            file_name=new_name, thumb=thumb, force_document=True
+        )
+
     state.stats["uploaded"] += size
     log.info("Uploaded: %s (%s)", new_name, human_size(size))
 
