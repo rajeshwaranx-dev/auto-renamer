@@ -18,10 +18,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("leechbot")
 
-BOT_TOKEN    = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS    = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-MONGO_URL    = os.getenv("MONGO_URL", "")
-MONGO_DB     = os.getenv("MONGO_DB_NAME", "leech_bot")
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "8361529441:AAGfl604PFp9OHLKyL8kcTnQoBTCo8oXAIg")
+ADMIN_IDS    = [int(x) for x in os.getenv("ADMIN_IDS", "7246154050").split(",") if x.strip()]
+MONGO_URL    = os.getenv("MONGO_URL", "mongodb+srv://Askrss:Askrssx@cluster0.1mqswlh.mongodb.net/?appName=Cluster0")
+MONGO_DB     = os.getenv("MONGO_DB_NAME", "Askrss")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/leech")
 
 # Default caption template placeholders:
