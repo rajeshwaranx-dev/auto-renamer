@@ -1,27 +1,28 @@
 """
 state.py — Shared mutable state.
 """
+import asyncio
 
-# PTB Application instance
 bot_app = None
 
-# Session stats
 stats = {
-    "total":      0,
-    "by_user":    {},
-    "failed":     0,
-    "downloaded": 0,   # bytes downloaded this session
-    "uploaded":   0,   # bytes uploaded this session
+    "total": 0, "by_user": {},
+    "failed": 0, "downloaded": 0, "uploaded": 0,
 }
 
-# Users currently awaiting a thumbnail photo
-# { user_id (int): True }
-awaiting_thumb: dict[int, bool] = {}
+awaiting_thumb:  dict[int, bool] = {}
+awaiting_input:  dict[int, str]  = {}
+active_tasks:    dict[int, int]  = {}
 
-# Active leech tasks per user (to avoid duplicate processing)
-# { user_id: count }
-active_tasks: dict[int, int] = {}
+# ── Task queue system ──────────────────────────────────────────
+# Global queue of (user, message, context) tuples
+task_queue: asyncio.Queue = None
+# Semaphore — max 20 concurrent tasks across all users
+task_semaphore: asyncio.Semaphore = None
+# Pending count per user (for display)
+pending_count: dict[int, int] = {}
 
-# Users awaiting text input from /settings menu
-# { user_id: "prefix" | "caption" | "dump" }
-awaiting_input: dict[int, str] = {}
+def init_queue():
+    global task_queue, task_semaphore
+    task_queue     = asyncio.Queue()
+    task_semaphore = asyncio.Semaphore(20)
