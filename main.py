@@ -1,43 +1,60 @@
-import atexit, datetime, os, signal, sys, traceback
+import atexit, datetime, os, signal, sys, traceback, asyncio
 import requests
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from config import BOT_TOKEN, ADMIN_IDS, MONGO_URL, DOWNLOAD_DIR, API_ID, API_HASH, SESSION_STRING, log
 from database import all_users
 import state
-from commands_admin import start_command, commands_command, adduser_command, removeuser_command, listusers_command, userinfo_command, toggleuser_command, stats_command, broadcast_command
-from commands_user import myinfo_command, setsource_command, removesource_command, setchannel_command, setprefix_command, removeprefix_command, setcaption_command, resetcaption_command, setthumb_command, removethumb_command
-from handlers import handle_channel_post, handle_thumb_photo, init_pyro_client, stop_pyro_client
+from commands_admin import (start_command, commands_command, adduser_command, removeuser_command,
+    listusers_command, userinfo_command, toggleuser_command, stats_command, broadcast_command)
+from commands_user import (myinfo_command, setsource_command, removesource_command, setchannel_command,
+    setprefix_command, removeprefix_command, setcaption_command, resetcaption_command,
+    setthumb_command, removethumb_command)
+from handlers import handle_channel_post, handle_thumb_photo, init_pyro_client, stop_pyro_client, queue_worker
 from settings import settings_command, settings_callback, handle_settings_input
 
 def _sync_notify(text):
-    if not BOT_TOKEN or not ADMIN_IDS:
-        return
+    if not BOT_TOKEN or not ADMIN_IDS: return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     for admin_id in ADMIN_IDS:
-        try:
-            requests.post(url, data={"chat_id": admin_id, "text": text, "parse_mode": "HTML"}, timeout=10)
-        except Exception as exc:
-            log.warning("Sync notify failed: %s", exc)
+        try: requests.post(url, data={"chat_id":admin_id,"text":text,"parse_mode":"HTML"}, timeout=10)
+        except Exception as exc: log.warning("Notify failed: %s", exc)
 
 def _offline_msg(reason, extra=""):
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
     return (f"⚠️ <b>LeechBot Offline</b>\n\n🕐 {now} UTC\n❗ <b>{reason}</b>\n"
-            f"📦 Posts: {state.stats.get('total', 0)}\n"
-            f"{('📋 ' + extra + chr(10)) if extra else ''}"
+            f"📦 Posts: {state.stats.get('total',0)}\n"
+            f"{('📋 '+extra+chr(10)) if extra else ''}"
             f"Restart: <code>systemctl restart leechbot</code>")
 
 async def on_startup(app):
     state.bot_app = app
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+    # Init queue
+    state.init_queue()
+
+    # Start queue workers (3 workers, each handles up to 20 concurrent via semaphore)
+    for _ in range(3):
+        asyncio.create_task(queue_worker())
+    log.info("Queue workers started (max 20 concurrent tasks)")
+
+    # Init Pyrogram
     if API_ID and API_HASH:
         await init_pyro_client(api_id=API_ID, api_hash=API_HASH,
             session_string=SESSION_STRING, bot_token=BOT_TOKEN if not SESSION_STRING else "")
     else:
         log.warning("API_ID/API_HASH not set")
+
     users  = await all_users()
     active = [u for u in users if u.get("active")]
     now    = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
-    _sync_notify(f"✅ <b>LeechBot Online</b>\n\n🕐 {now} UTC\n👥 {len(active)} active / {len(users)} total\n\nBot ready! 🚀")
+    _sync_notify(
+        f"✅ <b>LeechBot Online</b>\n\n"
+        f"🕐 {now} UTC\n"
+        f"👥 {len(active)} active / {len(users)} total\n"
+        f"🔄 Max concurrent tasks: 20\n\n"
+        f"Bot ready! 🚀"
+    )
     log.info("LeechBot started. %d active / %d total", len(active), len(users))
 
 async def on_shutdown(app=None):
@@ -46,10 +63,9 @@ async def on_shutdown(app=None):
     await stop_pyro_client()
     _sync_notify(_offline_msg("Graceful Shutdown"))
 
-_signal_names = {signal.SIGTERM: "SIGTERM", signal.SIGINT: "SIGINT"}
+_signal_names = {signal.SIGTERM:"SIGTERM", signal.SIGINT:"SIGINT"}
 def _make_sig(name):
-    def _h(s, f):
-        _sync_notify(_offline_msg(name)); sys.exit(0)
+    def _h(s, f): _sync_notify(_offline_msg(name)); sys.exit(0)
     return _h
 for _s, _n in _signal_names.items():
     try: signal.signal(_s, _make_sig(_n))
@@ -57,8 +73,7 @@ for _s, _n in _signal_names.items():
 
 _orig = sys.excepthook
 def _hook(t, v, tb):
-    if issubclass(t, (KeyboardInterrupt, SystemExit)):
-        _orig(t, v, tb); return
+    if issubclass(t, (KeyboardInterrupt, SystemExit)): _orig(t, v, tb); return
     _sync_notify(_offline_msg("Crash", f"{t.__name__}: {str(v)[:200]}"))
     _orig(t, v, tb)
 sys.excepthook = _hook
@@ -110,8 +125,7 @@ if __name__ == "__main__":
     try:
         app.run_polling(drop_pending_updates=True)
     except Exception as exc:
-        _sync_notify(_offline_msg("run_polling Crashed", f"{type(exc).__name__}: {str(exc)[:200]}"))
-        _notified_offline = True
-        raise
+        _sync_notify(_offline_msg("Crash", f"{type(exc).__name__}: {str(exc)[:200]}"))
+        _notified_offline = True; raise
     finally:
         _notified_offline = True
