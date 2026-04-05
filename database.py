@@ -1,22 +1,6 @@
 """
 database.py — MongoDB CRUD via Motor (async).
-
-User document schema:
-{
-  "user_id":          int,
-  "name":             str,
-  "active":           bool,
-  "source_channels":  list[str],
-  "dest_channel":     str | None,
-  "file_prefix":      str,
-  "caption_template": str,
-  "thumb":            str | None,   # Telegram file_id of thumbnail
-  "thumb_path":       str | None,   # local path of downloaded thumb
-  "added_at":         str,
-  "stats":            {"total": int, "failed": int}
-}
 """
-
 import datetime
 from motor.motor_asyncio import AsyncIOMotorClient
 from config import MONGO_URL, MONGO_DB, log
@@ -24,45 +8,34 @@ from config import MONGO_URL, MONGO_DB, log
 _client = None
 _db     = None
 
-
 def _get_db():
     global _client, _db
     if _db is None:
         if not MONGO_URL:
-            log.warning("MONGO_URL not set — DB calls will fail!")
-            return None
+            log.warning("MONGO_URL not set"); return None
         _client = AsyncIOMotorClient(MONGO_URL)
         _db     = _client[MONGO_DB]
     return _db
 
-
 async def get_user(user_id: int) -> dict | None:
     db = _get_db()
-    if db is None:
-        return None
+    if db is None: return None
     return await db.users.find_one({"user_id": user_id})
-
 
 async def all_users() -> list[dict]:
     db = _get_db()
-    if db is None:
-        return []
+    if db is None: return []
     return await db.users.find().to_list(None)
-
 
 async def active_users() -> list[dict]:
     db = _get_db()
-    if db is None:
-        return []
+    if db is None: return []
     return await db.users.find({"active": True}).to_list(None)
-
 
 async def add_user(user_id: int, name: str) -> bool:
     db = _get_db()
-    if db is None:
-        return False
-    existing = await db.users.find_one({"user_id": user_id})
-    if existing:
+    if db is None: return False
+    if await db.users.find_one({"user_id": user_id}):
         return False
     await db.users.insert_one({
         "user_id":          user_id,
@@ -70,88 +43,101 @@ async def add_user(user_id: int, name: str) -> bool:
         "active":           True,
         "source_channels":  [],
         "dest_channel":     None,
+        "log_channel":      None,
         "file_prefix":      "",
-        "caption_template": "<b>{newname}</b>",
+        "strip_words":      "",
+        "caption_template": "<b>{newname}</b>\n\n🌐 Language : {languages}\n📺 Quality : {quality}",
         "thumb":            None,
-        "thumb_path":       None,
+        "send_mode":        "Document",
+        "dump_channel":     None,
+        "metadata_title":   "",
+        "audio_track_title": "",
         "added_at":         datetime.datetime.utcnow().isoformat(),
         "stats":            {"total": 0, "failed": 0},
     })
     return True
 
-
 async def remove_user(user_id: int) -> bool:
     db = _get_db()
-    if db is None:
-        return False
+    if db is None: return False
     r = await db.users.delete_one({"user_id": user_id})
     return r.deleted_count > 0
 
-
 async def toggle_user(user_id: int) -> bool | None:
     db = _get_db()
-    if db is None:
-        return None
+    if db is None: return None
     user = await db.users.find_one({"user_id": user_id})
-    if not user:
-        return None
+    if not user: return None
     new_state = not user.get("active", True)
     await db.users.update_one({"user_id": user_id}, {"$set": {"active": new_state}})
     return new_state
 
-
 async def update_user(user_id: int, **kwargs) -> None:
     db = _get_db()
-    if db is None:
-        return
+    if db is None: return
     await db.users.update_one({"user_id": user_id}, {"$set": kwargs})
-
 
 async def add_source_channel(user_id: int, channel_id: str) -> bool:
     db = _get_db()
-    if db is None:
-        return False
+    if db is None: return False
     user = await db.users.find_one({"user_id": user_id})
-    if not user:
-        return False
+    if not user: return False
     sources = user.get("source_channels") or []
-    if channel_id in sources:
-        return False
+    if channel_id in sources: return False
     sources.append(channel_id)
     await db.users.update_one({"user_id": user_id}, {"$set": {"source_channels": sources}})
     return True
 
-
 async def remove_source_channel(user_id: int, channel_id: str) -> bool:
     db = _get_db()
-    if db is None:
-        return False
+    if db is None: return False
     user = await db.users.find_one({"user_id": user_id})
-    if not user:
-        return False
+    if not user: return False
     sources = user.get("source_channels") or []
-    if channel_id not in sources:
-        return False
+    if channel_id not in sources: return False
     sources.remove(channel_id)
     await db.users.update_one({"user_id": user_id}, {"$set": {"source_channels": sources}})
     return True
 
-
 async def increment_stats(user_id: int, failed: bool = False) -> None:
     db = _get_db()
-    if db is None:
-        return
-    if failed:
-        await db.users.update_one({"user_id": user_id}, {"$inc": {"stats.failed": 1}})
-    else:
-        await db.users.update_one({"user_id": user_id}, {"$inc": {"stats.total": 1}})
-
+    if db is None: return
+    key = "stats.failed" if failed else "stats.total"
+    await db.users.update_one({"user_id": user_id}, {"$inc": {key: 1}})
 
 async def users_for_source(channel_id: str) -> list[dict]:
     db = _get_db()
-    if db is None:
-        return []
+    if db is None: return []
     return await db.users.find({
-        "active":          True,
-        "source_channels": channel_id,
+        "active": True, "source_channels": channel_id
     }).to_list(None)
+
+# ── Duplicate detection ────────────────────────────────────────
+# Store processed file_ids per user to skip duplicates
+
+async def is_duplicate(user_id: int, file_id: str) -> bool:
+    """Check if this exact file_id was already processed by this user."""
+    db = _get_db()
+    if db is None: return False
+    result = await db.processed.find_one({"user_id": user_id, "file_id": file_id})
+    return result is not None
+
+async def mark_processed(user_id: int, file_id: str, filename: str) -> None:
+    """Mark a file_id as processed. Keeps last 5000 per user."""
+    db = _get_db()
+    if db is None: return
+    await db.processed.insert_one({
+        "user_id":  user_id,
+        "file_id":  file_id,
+        "filename": filename,
+        "ts":       datetime.datetime.utcnow(),
+    })
+    # Keep only last 5000 per user to avoid bloat
+    count = await db.processed.count_documents({"user_id": user_id})
+    if count > 5000:
+        oldest = await db.processed.find(
+            {"user_id": user_id}, sort=[("ts", 1)]
+        ).limit(count - 5000).to_list(None)
+        ids = [d["_id"] for d in oldest]
+        if ids:
+            await db.processed.delete_many({"_id": {"$in": ids}})
