@@ -21,3 +21,7 @@ awaiting_thumb: dict[int, bool] = {}
 # Active leech tasks per user (to avoid duplicate processing)
 # { user_id: count }
 active_tasks: dict[int, int] = {}
+
+# Users awaiting text input from /settings menu
+# { user_id: "prefix" | "caption" | "dump" }
+awaiting_input: dict[int, str] = {}
