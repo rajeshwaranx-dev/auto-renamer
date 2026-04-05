@@ -220,3 +220,26 @@ async def removethumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         "✅ Thumbnail removed.\n"
         "Videos will use auto-extracted frame as thumbnail."
     )
+
+
+# ── /setlogchannel ─────────────────────────────────────────────
+
+@user_only
+async def setlogchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: <code>/setlogchannel &lt;channel_id&gt;</code>\n\n"
+            "All task events will be sent to this channel.\n"
+            "Make sure bot is admin there.",
+            parse_mode=ParseMode.HTML); return
+    channel_id = args[0].strip()
+    if not channel_id.lstrip("-").isdigit():
+        await update.message.reply_text(
+            "❌ Invalid ID. Must be like <code>-1001234567890</code>",
+            parse_mode=ParseMode.HTML); return
+    uid = update.effective_user.id
+    await update_user(uid, log_channel=channel_id)
+    await update.message.reply_text(
+        f"✅ Log channel set: <code>{channel_id}</code>",
+        parse_mode=ParseMode.HTML)
