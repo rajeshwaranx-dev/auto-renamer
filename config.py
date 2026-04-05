@@ -27,6 +27,9 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/leech")
 API_ID         = int(os.getenv("API_ID", "23361081") or "0")
 API_HASH       = os.getenv("API_HASH", "0605c5395b91ead763072251e20c3417")
 SESSION_STRING = os.getenv("SESSION_STRING", "")   # optional user session for 4GB
+# Bot-wide log channel (set by admin via /bsettings)
+# Can also be set in .env as fallback
+BOT_LOG_CHANNEL = os.getenv("BOT_LOG_CHANNEL", "")
 
 # Default caption template placeholders:
 #   {filename}  original filename
