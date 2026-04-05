@@ -1,5 +1,5 @@
 """
-database.py — MongoDB CRUD via Motor (async).
+database.py — MongoDB CRUD. Duplicate expiry: 10 minutes.
 """
 import datetime
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -7,12 +7,12 @@ from config import MONGO_URL, MONGO_DB, log
 
 _client = None
 _db     = None
+DUPLICATE_EXPIRY_MINUTES = 10
 
 def _get_db():
     global _client, _db
     if _db is None:
-        if not MONGO_URL:
-            log.warning("MONGO_URL not set"); return None
+        if not MONGO_URL: log.warning("MONGO_URL not set"); return None
         _client = AsyncIOMotorClient(MONGO_URL)
         _db     = _client[MONGO_DB]
     return _db
@@ -35,25 +35,23 @@ async def active_users() -> list[dict]:
 async def add_user(user_id: int, name: str) -> bool:
     db = _get_db()
     if db is None: return False
-    if await db.users.find_one({"user_id": user_id}):
-        return False
+    if await db.users.find_one({"user_id": user_id}): return False
     await db.users.insert_one({
-        "user_id":          user_id,
-        "name":             name,
-        "active":           True,
-        "source_channels":  [],
-        "dest_channel":     None,
-        "log_channel":      None,
-        "file_prefix":      "",
-        "strip_words":      "",
-        "caption_template": "<b>{newname}</b>\n\n🌐 Language : {languages}\n📺 Quality : {quality}",
-        "thumb":            None,
-        "send_mode":        "Document",
-        "dump_channel":     None,
-        "metadata_title":   "",
+        "user_id":           user_id,
+        "name":              name,
+        "active":            True,
+        "source_channels":   [],
+        "dest_channel":      None,
+        "file_prefix":       "",
+        "strip_words":       "",
+        "caption_template":  "",
+        "thumb":             None,
+        "send_mode":         "Document",
+        "dump_channel":      None,
+        "metadata_title":    "",
         "audio_track_title": "",
-        "added_at":         datetime.datetime.utcnow().isoformat(),
-        "stats":            {"total": 0, "failed": 0},
+        "added_at":          datetime.datetime.utcnow().isoformat(),
+        "stats":             {"total": 0, "failed": 0},
     })
     return True
 
@@ -112,18 +110,26 @@ async def users_for_source(channel_id: str) -> list[dict]:
         "active": True, "source_channels": channel_id
     }).to_list(None)
 
-# ── Duplicate detection ────────────────────────────────────────
-# Store processed file_ids per user to skip duplicates
+# ── Duplicate detection — 10 minute expiry ─────────────────────
 
 async def is_duplicate(user_id: int, file_id: str) -> bool:
-    """Check if this exact file_id was already processed by this user."""
+    """
+    Returns True if this file_id was processed by this user
+    within the last 10 minutes.
+    """
     db = _get_db()
     if db is None: return False
-    result = await db.processed.find_one({"user_id": user_id, "file_id": file_id})
+    expiry_time = datetime.datetime.utcnow() - datetime.timedelta(
+        minutes=DUPLICATE_EXPIRY_MINUTES)
+    result = await db.processed.find_one({
+        "user_id": user_id,
+        "file_id": file_id,
+        "ts":      {"$gte": expiry_time},   # only within last 10 mins
+    })
     return result is not None
 
 async def mark_processed(user_id: int, file_id: str, filename: str) -> None:
-    """Mark a file_id as processed. Keeps last 5000 per user."""
+    """Record a processed file. Keeps last 5000 per user."""
     db = _get_db()
     if db is None: return
     await db.processed.insert_one({
@@ -132,7 +138,7 @@ async def mark_processed(user_id: int, file_id: str, filename: str) -> None:
         "filename": filename,
         "ts":       datetime.datetime.utcnow(),
     })
-    # Keep only last 5000 per user to avoid bloat
+    # Keep only last 5000 per user
     count = await db.processed.count_documents({"user_id": user_id})
     if count > 5000:
         oldest = await db.processed.find(
@@ -141,3 +147,17 @@ async def mark_processed(user_id: int, file_id: str, filename: str) -> None:
         ids = [d["_id"] for d in oldest]
         if ids:
             await db.processed.delete_many({"_id": {"$in": ids}})
+
+# ── Bot-wide settings ──────────────────────────────────────────
+
+async def get_bot_settings() -> dict:
+    db = _get_db()
+    if db is None: return {}
+    doc = await db.bot_settings.find_one({"_id": "global"})
+    return doc or {}
+
+async def set_bot_settings(**kwargs) -> None:
+    db = _get_db()
+    if db is None: return
+    await db.bot_settings.update_one(
+        {"_id": "global"}, {"$set": kwargs}, upsert=True)
