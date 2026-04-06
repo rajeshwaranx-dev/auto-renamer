@@ -11,7 +11,9 @@ from commands_admin import (start_command, commands_command, adduser_command,
 from commands_user import (myinfo_command, setsource_command, removesource_command,
     setchannel_command, setprefix_command, removeprefix_command, setcaption_command,
     resetcaption_command, setthumb_command, removethumb_command)
-from handlers import handle_channel_post, handle_thumb_photo, init_pyro_client, stop_pyro_client, queue_worker
+from handlers import (handle_channel_post, handle_thumb_photo,
+    init_pyro_client, stop_pyro_client, queue_worker,
+    status_command, status_callback)
 from settings import settings_command, settings_callback, handle_settings_input
 from bsettings import bsettings_command, bsettings_callback, handle_bsettings_input
 from logger import log_bot_start, log_bot_stop
@@ -67,7 +69,7 @@ for _s, _n in {signal.SIGTERM:"SIGTERM", signal.SIGINT:"SIGINT"}.items():
     try: signal.signal(_s, lambda s,f,n=_n: (_sync_notify(_offline_msg(n)), sys.exit(0)))
     except: pass
 
-import sys, traceback
+import traceback
 _orig_hook = sys.excepthook
 def _hook(t, v, tb):
     if issubclass(t, (KeyboardInterrupt, SystemExit)): _orig_hook(t, v, tb); return
@@ -92,7 +94,7 @@ if __name__ == "__main__":
         .connect_timeout(60).pool_timeout(600).build())
     state.bot_app = app
 
-    # Admin commands
+    # Admin
     app.add_handler(CommandHandler("start",        start_command))
     app.add_handler(CommandHandler("commands",     commands_command))
     app.add_handler(CommandHandler("adduser",      adduser_command))
@@ -104,7 +106,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("broadcast",    broadcast_command))
     app.add_handler(CommandHandler("bsettings",    bsettings_command))
 
-    # User commands
+    # User
     app.add_handler(CommandHandler("myinfo",       myinfo_command))
     app.add_handler(CommandHandler("setsource",    setsource_command))
     app.add_handler(CommandHandler("removesource", removesource_command))
@@ -116,18 +118,19 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("setthumb",     setthumb_command))
     app.add_handler(CommandHandler("removethumb",  removethumb_command))
     app.add_handler(CommandHandler("settings",     settings_command))
+    app.add_handler(CommandHandler("status",       status_command))
 
-    # Callbacks — bsettings uses bs_ prefix, settings uses s_ prefix
+    # Callbacks
     app.add_handler(CallbackQueryHandler(bsettings_callback, pattern="^bs_"))
     app.add_handler(CallbackQueryHandler(settings_callback,  pattern="^s_"))
+    app.add_handler(CallbackQueryHandler(status_callback,    pattern="^status_"))
 
-    # Photo handler for thumbnails
+    # Photo
     app.add_handler(MessageHandler(
-        filters.PHOTO & filters.ChatType.PRIVATE,
-        handle_thumb_photo))
+        filters.PHOTO & filters.ChatType.PRIVATE, handle_thumb_photo))
 
-    # Text input — single handler that routes internally
-    async def _combined_text_handler(update, context):
+    # Text input — single combined handler
+    async def _text_handler(update, context):
         uid  = update.effective_user.id if update.effective_user else None
         mode = state.awaiting_input.get(uid, "")
         if mode.startswith("bs_"):
@@ -137,7 +140,7 @@ if __name__ == "__main__":
 
     app.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
-        _combined_text_handler))
+        _text_handler))
 
     # Channel posts
     app.add_handler(MessageHandler(
