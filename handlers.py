@@ -1,5 +1,8 @@
 """
 handlers.py — Core leech handler.
+- NO auto-detect prefix stripping (only manual strip words from admin)
+- 10-min duplicate expiry fix
+- Queue system max 20
 """
 import os, re, time, asyncio
 from pyrogram import Client as PyroClient
@@ -39,7 +42,6 @@ async def init_pyro_client(api_id, api_hash, session_string="", bot_token=""):
         await _pyro_client.start()
         me = await _pyro_client.get_me()
         log.info("Pyrogram started as: %s", me.first_name)
-        # Pre-warm all channel peers
         users = await all_users()
         for u in users:
             for ch in (u.get("source_channels") or []):
@@ -50,7 +52,6 @@ async def init_pyro_client(api_id, api_hash, session_string="", bot_token=""):
                 if ch:
                     try: await _pyro_client.get_chat(int(ch))
                     except: pass
-        # Also warm bot-wide log channel
         try:
             from database import get_bot_settings
             s = await get_bot_settings()
@@ -65,62 +66,54 @@ async def stop_pyro_client():
     if _pyro_client and _pyro_client.is_connected:
         await _pyro_client.stop()
 
-# ── Filename cleaner ───────────────────────────────────────────
-
-TITLE_INDICATORS = re.compile(
-    r"\b(S\d{1,2}|EP?\d{1,3}|Season|Episode|Part|\d{4}|"
-    r"480p|720p|1080p|4K|WEB|BluRay|HDRip|CAM|HDCAM|PreDVD|HQ)\b",
-    re.IGNORECASE
-)
+# ── Filename cleaner — NO auto-detect, only manual strip words ─
 
 def _split_ext(filename):
     m = re.match(r"^(.*?)(\.[a-zA-Z0-9]{2,5})$", filename)
     return (m.group(1), m.group(2)) if m else (filename, "")
 
 def clean_original_name(filename: str, strip_words: list[str] = None) -> str:
+    """
+    Strip ONLY:
+    1. User-defined strip words (set by admin via /bsettings)
+    2. [tags] like [ASK], [720p]
+    3. @channel mentions at start
+    NO auto-detection — prevents stripping real title words like 'Sarvam'
+    """
     name, ext = _split_ext(filename)
-    original  = name
+    # Normalize separators to spaces
     name = re.sub(r"[_.]", " ", name).strip()
 
-    # 1. User strip words
+    # 1. Strip user-defined words ONLY
     if strip_words:
         for word in strip_words:
             word = word.strip()
             if not word: continue
-            name = re.sub(r"^\s*" + re.escape(word) + r"\s*[-_]?\s*",
-                          "", name, flags=re.IGNORECASE).strip()
+            # Strip at start of filename with optional separator after
+            name = re.sub(
+                r"^\s*" + re.escape(word) + r"\s*[-_]?\s*",
+                "", name, flags=re.IGNORECASE
+            ).strip()
 
-    # 2. [tags]
+    # 2. Strip [tags] at start like [ASK], [720p]
     name = re.sub(r"^\s*\[[^\]]{1,30}\]\s*", "", name).strip()
-    # 3. @channel
+
+    # 3. Strip @channel at start
     name = re.sub(r"^\s*@\S+\s*[-]?\s*", "", name).strip()
-    # 4. Emoji/boxed letters at start
-    name = re.sub(r"^[\U0001F100-\U0001F9FF\s]+", "", name).strip()
 
-    # 5. Auto-detect: "ChannelWord ActualTitle 2024..."
-    words = name.split()
-    if len(words) >= 3:
-        first = words[0]
-        rest  = " ".join(words[1:])
-        if (re.match(r"^[A-Za-z][A-Za-z0-9]{1,20}$", first) and
-            not re.match(r"^\d{4}$", first) and
-            re.match(r"^[A-Z]", rest) and
-            TITLE_INDICATORS.search(rest)):
-            name = rest
-
+    # 4. Clean multiple spaces
     name = re.sub(r"\s+", " ", name).strip()
-    log.info("Cleaned: %r → %r", original, name)
+
+    log.info("Filename: %r → %r (strip_words=%r)", _split_ext(filename)[0], name, strip_words)
     return name + ext
 
 
 def _build_caption(template: str, languages: str, quality: str, **kwargs) -> str:
     """
-    Build caption smartly:
-    - If template is empty/default, auto-build with only non-empty fields
-    - If custom template, use it but strip lines with empty values
+    Build caption. If no template, auto-build with only non-empty fields.
+    Lines with empty language/quality are hidden automatically.
     """
     if not template:
-        # Auto-build default caption
         parts = [f"<b>{kwargs.get('newname','')}</b>"]
         if languages: parts.append(f"\n🌐 Language : {languages}")
         if quality:   parts.append(f"\n📺 Quality : {quality}")
@@ -132,16 +125,16 @@ def _build_caption(template: str, languages: str, quality: str, **kwargs) -> str
             quality=quality or "—",
             **kwargs
         )
-        # Remove lines that show "— " or empty values
+        # Remove lines that show empty label like "Language : —"
         lines = result.split("\n")
         cleaned = []
         for line in lines:
-            # Skip lines that contain only a label + "—" or label + nothing
-            if re.search(r"(Language|Quality|Source)\s*:\s*(—|-)?\s*$",
-                         line.strip(), re.IGNORECASE):
+            if re.search(
+                r"(Language|Quality|Source|Lang)\s*:\s*(—|--)?\s*$",
+                line.strip(), re.IGNORECASE
+            ):
                 continue
             cleaned.append(line)
-        # Collapse 3+ newlines into 2
         result = re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned)).strip()
         return result
     except Exception:
@@ -165,6 +158,7 @@ def _fmt_eta(s):
     elif s < 3600: return f"{int(s//60)}m {int(s%60)}s"
     else: return f"{int(s//3600)}h {int((s%3600)//60)}m"
 
+
 # ── Progress ───────────────────────────────────────────────────
 
 class ProgressTracker:
@@ -179,8 +173,8 @@ class ProgressTracker:
         try:
             pct     = current/total*100 if total else 0
             elapsed = now - self.start_time
-            speed   = current/elapsed if elapsed>0 else 0
-            eta     = (total-current)/speed if speed>0 else 0
+            speed   = current/elapsed if elapsed > 0 else 0
+            eta     = (total-current)/speed if speed > 0 else 0
             filled  = int(pct/10)
             bar     = "●"*filled + "○"*(10-filled)
             emoji   = "⬇️" if "Down" in self.label else "⬆️"
@@ -193,6 +187,7 @@ class ProgressTracker:
                       f"⚡ {human_size(int(speed))}/s\n"
                       f"⏱ ETA: {_fmt_eta(eta)} | ⏳ {_fmt_eta(elapsed)}"))
         except: pass
+
 
 # ── Download / Upload ──────────────────────────────────────────
 
@@ -222,17 +217,21 @@ async def _pyro_upload(pyro, message, dest_channel, file_path, new_name,
     ext   = os.path.splitext(file_path)[1].lower()
     thumb = thumb_path if thumb_path and os.path.exists(thumb_path) else None
     prog  = tracker.update if tracker else None
-    if ext in {".mp4",".m4v"}:
-        await pyro.send_video(chat_id=dest_channel, video=file_path, caption=caption,
-            file_name=new_name, thumb=thumb, supports_streaming=True, progress=prog)
+    if ext in {".mp4", ".m4v"}:
+        await pyro.send_video(chat_id=dest_channel, video=file_path,
+            caption=caption, file_name=new_name, thumb=thumb,
+            supports_streaming=True, progress=prog)
     elif ext in {".mp3",".m4a",".flac",".ogg",".opus",".aac",".wav"} or message.audio:
-        await pyro.send_audio(chat_id=dest_channel, audio=file_path, caption=caption,
-            file_name=new_name, thumb=thumb, title=new_name, progress=prog)
+        await pyro.send_audio(chat_id=dest_channel, audio=file_path,
+            caption=caption, file_name=new_name, thumb=thumb,
+            title=new_name, progress=prog)
     else:
-        await pyro.send_document(chat_id=dest_channel, document=file_path, caption=caption,
-            file_name=new_name, thumb=thumb, force_document=True, progress=prog)
+        await pyro.send_document(chat_id=dest_channel, document=file_path,
+            caption=caption, file_name=new_name, thumb=thumb,
+            force_document=True, progress=prog)
     state.stats["uploaded"] += size
     log.info("Uploaded: %s (%s)", new_name, human_size(size))
+
 
 # ── Single task ────────────────────────────────────────────────
 
@@ -244,31 +243,36 @@ async def _process_task(user, message, bot, pyro):
     file_size     = getattr(media, "file_size", 0) or 0
     file_id       = getattr(media, "file_id", "")
     prefix        = (user.get("file_prefix") or "").strip()
-    strip_words   = [w.strip() for w in (user.get("strip_words") or "").split(",") if w.strip()]
 
-    # ── Duplicate check (10-min expiry) ────────────────────────
+    # Strip words set by admin only — NO auto-detect
+    strip_words = [
+        w.strip() for w in (user.get("strip_words") or "").split(",")
+        if w.strip()
+    ]
+
+    # ── Duplicate check (10-min window) ───────────────────────
     if file_id and await is_duplicate(uid, file_id):
-        log.info("Duplicate (10min) skipped | user=%s | %s", user["name"], original_name)
+        log.info("Duplicate skipped (10min) | user=%s | %s", user["name"], original_name)
         await log_duplicate(bot, user, original_name)
         try:
             await bot.send_message(chat_id=uid, parse_mode=ParseMode.HTML,
                 text=f"⏭ <b>Duplicate Skipped</b>\n\n"
                      f"<code>{original_name}</code>\n\n"
-                     f"ℹ️ Same file was processed within last 10 minutes.")
+                     f"ℹ️ Same file processed within last 10 minutes.")
         except: pass
         return
 
-    # Clean + prefix
+    # Clean filename (no auto-detect)
     cleaned_name     = clean_original_name(original_name, strip_words)
     name_no_ext, ext = _split_ext(cleaned_name)
     new_name = f"{prefix} {name_no_ext}{ext}".strip() if prefix else cleaned_name
 
-    # Detect language and quality
+    # Detect language and quality from ORIGINAL filename
     languages = extract_languages(original_name)
     quality   = extract_quality(original_name)
     lang_str  = ", ".join(languages) if languages else ""
 
-    log.info("Detected | lang=%r quality=%r | file=%s", lang_str, quality, original_name)
+    log.info("Detected | lang=%r quality=%r | original=%s", lang_str, quality, original_name)
 
     dl_path        = os.path.join(DOWNLOAD_DIR, f"{uid}_{message.message_id}{ext}")
     processed_path = None
@@ -292,7 +296,8 @@ async def _process_task(user, message, bot, pyro):
 
         ok = await _pyro_download(message.chat.id, message.message_id, dl_path, tracker_dl)
         if not ok:
-            await increment_stats(uid, failed=True); state.stats["failed"] += 1
+            await increment_stats(uid, failed=True)
+            state.stats["failed"] += 1
             await log_task_failed(bot, user, original_name, "Download failed")
             if progress_msg: await progress_msg.edit_text("❌ Download failed.")
             return
@@ -310,8 +315,7 @@ async def _process_task(user, message, bot, pyro):
         try:
             meta_title = meta_title_tpl.format(
                 newname=new_name, filename=original_name, name=name_no_ext,
-                prefix=prefix, languages=lang_str or "—",
-                quality=quality, source="")
+                prefix=prefix, languages=lang_str or "—", quality=quality)
         except: meta_title = new_name
 
         custom_meta = {
@@ -326,7 +330,7 @@ async def _process_task(user, message, bot, pyro):
                                          parse_mode=ParseMode.HTML)
         processed_path = await embed_metadata(dl_path, thumb_dl_path, meta_title, custom_meta)
 
-        # Caption — auto-hides empty language/quality
+        # Caption
         caption = _build_caption(
             user.get("caption_template") or "",
             languages = lang_str,
@@ -350,7 +354,8 @@ async def _process_task(user, message, bot, pyro):
             thumb_path=thumb_dl_path, tracker=tracker_ul)
 
         # Mark processed
-        if file_id: await mark_processed(uid, file_id, original_name)
+        if file_id:
+            await mark_processed(uid, file_id, original_name)
 
         await increment_stats(uid)
         state.stats["total"] += 1
@@ -359,21 +364,23 @@ async def _process_task(user, message, bot, pyro):
         await log_task_done(bot, user, new_name, human_size(file_size),
                             lang_str, quality, thumb_dl_path)
 
-        # Done message
         done_lines = [f"✅ <b>Done!</b>\n\n<code>{new_name}</code>\n📦 {human_size(file_size)}"]
         if lang_str: done_lines.append(f"🌐 {lang_str}")
         if quality:  done_lines.append(f"📺 {quality}")
+
         if progress_msg:
             await progress_msg.edit_text("\n".join(done_lines), parse_mode=ParseMode.HTML)
 
     except Exception as exc:
         log.error("Error | user=%s: %s", user["name"], exc)
-        await increment_stats(uid, failed=True); state.stats["failed"] += 1
+        await increment_stats(uid, failed=True)
+        state.stats["failed"] += 1
         await log_task_failed(bot, user, original_name, str(exc))
         if progress_msg:
-            try: await progress_msg.edit_text(
-                f"❌ <b>Error:</b>\n<code>{str(exc)[:300]}</code>",
-                parse_mode=ParseMode.HTML)
+            try:
+                await progress_msg.edit_text(
+                    f"❌ <b>Error:</b>\n<code>{str(exc)[:300]}</code>",
+                    parse_mode=ParseMode.HTML)
             except: pass
     finally:
         to_clean = [dl_path, thumb_dl_path]
@@ -382,7 +389,8 @@ async def _process_task(user, message, bot, pyro):
         _cleanup(*to_clean)
         state.active_tasks[uid] = max(0, state.active_tasks.get(uid, 1) - 1)
 
-# ── Queue ──────────────────────────────────────────────────────
+
+# ── Queue worker ───────────────────────────────────────────────
 
 async def queue_worker():
     while True:
@@ -393,12 +401,15 @@ async def queue_worker():
             state.pending_count[uid] = max(0, state.pending_count.get(uid, 1) - 1)
             pyro = await get_pyro_client()
             if not pyro:
-                log.error("Pyrogram not available"); state.task_queue.task_done(); continue
+                log.error("Pyrogram not available — dropping task")
+                state.task_queue.task_done()
+                continue
             async with state.task_semaphore:
                 await _process_task(user, message, bot, pyro)
             state.task_queue.task_done()
         except Exception as e:
             log.error("Queue worker error: %s", e)
+
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.channel_post or update.message
@@ -429,6 +440,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                       f"📦 {human_size(file_size)}\n\n"
                       f"🔄 Active: {active}/20 | ⏳ Queue: {q_size}"))
         except: pass
+
 
 async def handle_thumb_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
