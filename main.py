@@ -1,4 +1,4 @@
-import atexit, datetime, os, signal, sys, traceback, asyncio
+import atexit, datetime, os, signal, sys, asyncio
 import requests
 from telegram.ext import (ApplicationBuilder, CommandHandler,
     MessageHandler, CallbackQueryHandler, filters)
@@ -23,7 +23,7 @@ def _sync_notify(text):
         try: requests.post(url, data={"chat_id":admin_id,"text":text,"parse_mode":"HTML"}, timeout=10)
         except: pass
 
-def _offline_msg(reason, extra=""):
+def _offline_msg(reason):
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
     return (f"⚠️ <b>LeechBot Offline</b>\n\n🕐 {now} UTC\n❗ <b>{reason}</b>\n"
             f"📦 Posts: {state.stats.get('total',0)}\n"
@@ -35,7 +35,7 @@ async def on_startup(app):
     state.init_queue()
     for _ in range(3):
         asyncio.create_task(queue_worker())
-    log.info("Queue workers started")
+    log.info("Queue workers started (max 20 concurrent)")
     if API_ID and API_HASH:
         await init_pyro_client(api_id=API_ID, api_hash=API_HASH,
             session_string=SESSION_STRING,
@@ -50,10 +50,8 @@ async def on_startup(app):
         f"✅ <b>LeechBot Online</b>\n\n"
         f"🕐 {now} UTC\n"
         f"👥 {len(active)} active / {len(users)} total\n"
-        f"🔄 Max concurrent: 20\n"
-        f"⏱ Duplicate expiry: 10 mins\n\n"
-        f"Ready! 🚀"
-    )
+        f"🔄 Max concurrent: 20 | ⏱ Dup expiry: 10 min\n\n"
+        f"Ready! 🚀")
     log.info("LeechBot started. %d active / %d total", len(active), len(users))
 
 async def on_shutdown(app=None):
@@ -65,19 +63,16 @@ async def on_shutdown(app=None):
     await stop_pyro_client()
     _sync_notify(_offline_msg("Graceful Shutdown"))
 
-_signal_names = {signal.SIGTERM:"SIGTERM", signal.SIGINT:"SIGINT"}
-def _make_sig(name):
-    def _h(s, f): _sync_notify(_offline_msg(name)); sys.exit(0)
-    return _h
-for _s, _n in _signal_names.items():
-    try: signal.signal(_s, _make_sig(_n))
+for _s, _n in {signal.SIGTERM:"SIGTERM", signal.SIGINT:"SIGINT"}.items():
+    try: signal.signal(_s, lambda s,f,n=_n: (_sync_notify(_offline_msg(n)), sys.exit(0)))
     except: pass
 
-_orig = sys.excepthook
+import sys, traceback
+_orig_hook = sys.excepthook
 def _hook(t, v, tb):
-    if issubclass(t, (KeyboardInterrupt, SystemExit)): _orig(t, v, tb); return
-    _sync_notify(_offline_msg("Crash", f"{t.__name__}: {str(v)[:200]}"))
-    _orig(t, v, tb)
+    if issubclass(t, (KeyboardInterrupt, SystemExit)): _orig_hook(t, v, tb); return
+    _sync_notify(_offline_msg(f"Crash: {t.__name__}: {str(v)[:150]}"))
+    _orig_hook(t, v, tb)
 sys.excepthook = _hook
 
 _notified_offline = False
@@ -97,40 +92,54 @@ if __name__ == "__main__":
         .connect_timeout(60).pool_timeout(600).build())
     state.bot_app = app
 
-    app.add_handler(CommandHandler("start",         start_command))
-    app.add_handler(CommandHandler("commands",      commands_command))
-    app.add_handler(CommandHandler("adduser",       adduser_command))
-    app.add_handler(CommandHandler("removeuser",    removeuser_command))
-    app.add_handler(CommandHandler("listusers",     listusers_command))
-    app.add_handler(CommandHandler("userinfo",      userinfo_command))
-    app.add_handler(CommandHandler("toggleuser",    toggleuser_command))
-    app.add_handler(CommandHandler("stats",         stats_command))
-    app.add_handler(CommandHandler("broadcast",     broadcast_command))
-    app.add_handler(CommandHandler("bsettings",     bsettings_command))
-    app.add_handler(CommandHandler("myinfo",        myinfo_command))
-    app.add_handler(CommandHandler("setsource",     setsource_command))
-    app.add_handler(CommandHandler("removesource",  removesource_command))
-    app.add_handler(CommandHandler("setchannel",    setchannel_command))
-    app.add_handler(CommandHandler("setprefix",     setprefix_command))
-    app.add_handler(CommandHandler("removeprefix",  removeprefix_command))
-    app.add_handler(CommandHandler("setcaption",    setcaption_command))
-    app.add_handler(CommandHandler("resetcaption",  resetcaption_command))
-    app.add_handler(CommandHandler("setthumb",      setthumb_command))
-    app.add_handler(CommandHandler("removethumb",   removethumb_command))
-    app.add_handler(CommandHandler("settings",      settings_command))
+    # Admin commands
+    app.add_handler(CommandHandler("start",        start_command))
+    app.add_handler(CommandHandler("commands",     commands_command))
+    app.add_handler(CommandHandler("adduser",      adduser_command))
+    app.add_handler(CommandHandler("removeuser",   removeuser_command))
+    app.add_handler(CommandHandler("listusers",    listusers_command))
+    app.add_handler(CommandHandler("userinfo",     userinfo_command))
+    app.add_handler(CommandHandler("toggleuser",   toggleuser_command))
+    app.add_handler(CommandHandler("stats",        stats_command))
+    app.add_handler(CommandHandler("broadcast",    broadcast_command))
+    app.add_handler(CommandHandler("bsettings",    bsettings_command))
 
-    # Callbacks — order matters: bsettings first, then settings
+    # User commands
+    app.add_handler(CommandHandler("myinfo",       myinfo_command))
+    app.add_handler(CommandHandler("setsource",    setsource_command))
+    app.add_handler(CommandHandler("removesource", removesource_command))
+    app.add_handler(CommandHandler("setchannel",   setchannel_command))
+    app.add_handler(CommandHandler("setprefix",    setprefix_command))
+    app.add_handler(CommandHandler("removeprefix", removeprefix_command))
+    app.add_handler(CommandHandler("setcaption",   setcaption_command))
+    app.add_handler(CommandHandler("resetcaption", resetcaption_command))
+    app.add_handler(CommandHandler("setthumb",     setthumb_command))
+    app.add_handler(CommandHandler("removethumb",  removethumb_command))
+    app.add_handler(CommandHandler("settings",     settings_command))
+
+    # Callbacks — bsettings uses bs_ prefix, settings uses s_ prefix
     app.add_handler(CallbackQueryHandler(bsettings_callback, pattern="^bs_"))
-    app.add_handler(CallbackQueryHandler(settings_callback))
+    app.add_handler(CallbackQueryHandler(settings_callback,  pattern="^s_"))
+
+    # Photo handler for thumbnails
+    app.add_handler(MessageHandler(
+        filters.PHOTO & filters.ChatType.PRIVATE,
+        handle_thumb_photo))
+
+    # Text input — single handler that routes internally
+    async def _combined_text_handler(update, context):
+        uid  = update.effective_user.id if update.effective_user else None
+        mode = state.awaiting_input.get(uid, "")
+        if mode.startswith("bs_"):
+            await handle_bsettings_input(update, context)
+        else:
+            await handle_settings_input(update, context)
 
     app.add_handler(MessageHandler(
-        filters.PHOTO & filters.ChatType.PRIVATE, handle_thumb_photo))
-    app.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
-        handle_bsettings_input), group=1)
-    app.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
-        handle_settings_input), group=2)
+        _combined_text_handler))
+
+    # Channel posts
     app.add_handler(MessageHandler(
         filters.ChatType.CHANNEL & ~filters.UpdateType.EDITED,
         handle_channel_post))
@@ -139,7 +148,7 @@ if __name__ == "__main__":
     try:
         app.run_polling(drop_pending_updates=True)
     except Exception as exc:
-        _sync_notify(_offline_msg("Crash", f"{type(exc).__name__}: {str(exc)[:200]}"))
+        _sync_notify(_offline_msg(f"Crash: {type(exc).__name__}: {str(exc)[:150]}"))
         _notified_offline = True; raise
     finally:
         _notified_offline = True
