@@ -114,31 +114,37 @@ async def users_for_source(channel_id: str) -> list[dict]:
 
 async def is_duplicate(user_id: int, file_id: str) -> bool:
     """
-    Returns True if this file_id was processed by this user
-    within the last 10 minutes.
+    True if file_id was processed by this user in last 10 minutes.
+    Uses Python datetime comparison (no MongoDB TTL index needed).
     """
     db = _get_db()
     if db is None: return False
-    expiry_time = datetime.datetime.utcnow() - datetime.timedelta(
-        minutes=DUPLICATE_EXPIRY_MINUTES)
+
+    # Cutoff = exactly 10 minutes ago in UTC
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(minutes=DUPLICATE_EXPIRY_MINUTES)
+
     result = await db.processed.find_one({
         "user_id": user_id,
         "file_id": file_id,
-        "ts":      {"$gte": expiry_time},   # only within last 10 mins
+        "ts":      {"$gte": cutoff},
     })
+    log.info("Duplicate check | user=%s file_id=%s cutoff=%s result=%s",
+             user_id, file_id[:20], cutoff.isoformat(), bool(result))
     return result is not None
 
 async def mark_processed(user_id: int, file_id: str, filename: str) -> None:
-    """Record a processed file. Keeps last 5000 per user."""
+    """Record processed file with UTC timestamp."""
     db = _get_db()
     if db is None: return
+    now = datetime.datetime.utcnow()
     await db.processed.insert_one({
         "user_id":  user_id,
         "file_id":  file_id,
         "filename": filename,
-        "ts":       datetime.datetime.utcnow(),
+        "ts":       now,
     })
-    # Keep only last 5000 per user
+    log.info("Marked processed | user=%s | file=%s | ts=%s", user_id, filename, now.isoformat())
+    # Keep last 5000 per user
     count = await db.processed.count_documents({"user_id": user_id})
     if count > 5000:
         oldest = await db.processed.find(
