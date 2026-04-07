@@ -1,5 +1,12 @@
 """
 handlers.py — Core leech handler.
+- Quality = ONLY resolution (480p, 720p, 1080p, 4K) — NOT HDRip/WEB-DL
+- Blank line between Language and Quality in caption
+- Source caption parser with lang\w* for typos
+- No auto-detect prefix stripping
+- 10-min duplicate expiry
+- Queue system max 20
+- /status command
 """
 import os, re, time, asyncio
 from pyrogram import Client as PyroClient
@@ -9,12 +16,248 @@ from telegram.constants import ParseMode
 from config import DOWNLOAD_DIR, log
 from database import (users_for_source, increment_stats, update_user,
                       all_users, is_duplicate, mark_processed)
-from ffmpeg_utils import (embed_metadata, extract_thumb_from_video, human_size,
-                           is_video, extract_languages, extract_quality)
+from ffmpeg_utils import embed_metadata, extract_thumb_from_video, human_size, is_video
 from logger import log_task_start, log_task_done, log_task_failed, log_duplicate
 import state
 
 _pyro_client = None
+
+# ── Resolution patterns (ONLY these — no HDRip/WEB-DL) ────────
+
+RESOLUTION_RULES = [
+    (r"\b4k\b|\b2160p\b",  "4K"),
+    (r"\b1080p\b|\bfhd\b", "1080p"),
+    (r"\b720p\b",          "720p"),
+    (r"\b480p\b",          "480p"),
+    (r"\b360p\b",          "360p"),
+    (r"\b240p\b",          "240p"),
+]
+
+LANG_PATTERNS = [
+    ("Tamil",     [r"\btamil\b", r"\btam\b", r"\btgl\b"]),
+    ("Telugu",    [r"\btelugu\b", r"\btel\b", r"\btelu\b"]),
+    ("Hindi",     [r"\bhindi\b", r"\bhin\b"]),
+    ("English",   [r"\benglish\b", r"\beng\b"]),
+    ("Malayalam", [r"\bmalayalam\b", r"\bmal\b"]),
+    ("Kannada",   [r"\bkannada\b", r"\bkan\b"]),
+    ("Bengali",   [r"\bbengali\b", r"\bben\b"]),
+    ("Marathi",   [r"\bmarathi\b", r"\bmar\b"]),
+    ("Chinese",   [r"\bchinese\b", r"\bchi\b", r"\bchn\b"]),
+    ("Japanese",  [r"\bjapanese\b", r"\bjpn\b"]),
+    ("Korean",    [r"\bkorean\b", r"\bkor\b"]),
+]
+
+
+def _extract_resolution(text: str) -> str:
+    """Extract ONLY resolution (480p, 720p, 1080p, 4K). Returns '' if none found."""
+    cleaned = re.sub(r"[_.\-\+\[\]()]", " ", text.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    for pat, val in RESOLUTION_RULES:
+        if re.search(pat, cleaned, re.IGNORECASE):
+            return val
+    return ""
+
+
+def _extract_languages_from_text(text: str) -> str:
+    """Extract languages from any text string."""
+    cleaned = re.sub(r"[_.\-\+\[\]()]", " ", text.lower())
+    found = []
+    for lang, patterns in LANG_PATTERNS:
+        for pat in patterns:
+            if re.search(r"\b" + pat.lstrip(r"\b").rstrip(r"\b") + r"\b",
+                         cleaned, re.IGNORECASE):
+                found.append(lang)
+                break
+    return ", ".join(found)
+
+
+# ── Source caption parser ──────────────────────────────────────
+
+def _is_promo_line(line: str) -> bool:
+    return bool(re.search(
+        r"(http[s]?://|fast\s+download|join\s*»|t\.me/)",
+        line, re.IGNORECASE
+    ))
+
+
+def parse_source_caption(caption: str) -> tuple[str, str]:
+    """
+    Extract Language + Quality (resolution only) from source caption.
+    lang\\w* matches: Language, Langauge, Lang etc.
+    Quality line: only accepts resolution (480p/720p/1080p/4K).
+    Falls back to scanning full caption text.
+    Returns (languages_str, resolution_str).
+    """
+    if not caption:
+        return "", ""
+
+    languages  = ""
+    resolution = ""
+
+    content_lines = [l for l in caption.split("\n") if not _is_promo_line(l)]
+
+    for line in content_lines:
+        stripped = line.strip()
+
+        # Language — lang\w* catches Langauge, Language, Lang
+        lang_m = re.match(r"lang\w*\s*[:\-]\s*(.+)", stripped, re.IGNORECASE)
+        if lang_m and not languages:
+            raw   = re.sub(r"#", "", lang_m.group(1)).strip()
+            parts = re.split(r"[,+&/\[\]|]+", raw)
+            langs = [p.strip().title() for p in parts
+                     if p.strip() and len(p.strip()) > 1]
+            languages = ", ".join(langs)
+            log.info("Caption lang: %r", languages)
+
+        # Quality — only accept resolution values
+        qual_m = re.match(r"quality\s*[:\-]\s*(.+)", stripped, re.IGNORECASE)
+        if qual_m and not resolution:
+            raw = re.sub(r"#", "", qual_m.group(1)).strip()
+            resolution = _extract_resolution(raw)
+            if resolution:
+                log.info("Caption quality (resolution): %r", resolution)
+
+    # Fallback: scan full content for resolution
+    if not resolution:
+        full_text = " ".join(content_lines)
+        resolution = _extract_resolution(full_text)
+        if resolution:
+            log.info("Fallback resolution from caption: %r", resolution)
+
+    # Fallback: scan full content for languages
+    if not languages:
+        full_text = " ".join(content_lines)
+        languages = _extract_languages_from_text(full_text)
+        if languages:
+            log.info("Fallback lang from caption: %r", languages)
+
+    return languages, resolution
+
+
+# ── Caption builders ───────────────────────────────────────────
+
+def build_final_caption(new_name: str, languages: str, resolution: str,
+                        custom_footer: str = "") -> str:
+    """
+    Default caption format with blank lines between fields:
+
+    filename
+
+    Language : Tamil
+
+    Quality : 1080p
+
+    📢 @custom_footer
+    """
+    parts = [f"<b>{new_name}</b>"]
+
+    if languages:
+        parts.append(f"\n\nLanguage : {languages}")
+
+    if resolution:
+        parts.append(f"\n\nQuality : {resolution}")
+
+    if custom_footer and custom_footer.strip():
+        parts.append(f"\n\n{custom_footer.strip()}")
+
+    return "".join(parts)
+
+
+def build_custom_caption(template: str, new_name: str, languages: str,
+                         resolution: str, **kwargs) -> str:
+    """User's full custom template."""
+    try:
+        result = template.format(
+            newname   = new_name,
+            languages = languages or "—",
+            quality   = resolution or "—",
+            **kwargs
+        )
+        lines = result.split("\n")
+        cleaned = []
+        for line in lines:
+            if re.search(
+                r"(Language|Quality)\s*:\s*(—|--)?\s*$",
+                line.strip(), re.IGNORECASE
+            ):
+                continue
+            cleaned.append(line)
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned)).strip()
+    except Exception:
+        return new_name
+
+
+# ── Filename cleaner ───────────────────────────────────────────
+
+def _split_ext(filename: str) -> tuple[str, str]:
+    """
+    Split filename into (name, ext).
+    Prioritizes known video/audio/doc extensions.
+    Falls back to last dot-separated part if 2-5 chars.
+    """
+    KNOWN_EXTS = {
+        ".mkv", ".mp4", ".avi", ".mov", ".webm", ".flv", ".ts", ".m4v",
+        ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wav",
+        ".pdf", ".zip", ".rar", ".7z", ".tar",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp",
+    }
+    # Try to find a known extension at the end
+    for ext in KNOWN_EXTS:
+        if filename.lower().endswith(ext):
+            return filename[:-len(ext)], ext
+
+    # Fallback: last segment if 2-5 chars
+    m = re.match(r"^(.*?)(\.[a-zA-Z0-9]{2,5})$", filename)
+    if m:
+        return m.group(1), m.group(2)
+
+    return filename, ""
+
+
+def clean_original_name(filename: str, strip_words: list[str] = None) -> str:
+    """Strip only manual strip_words + [tags] + @channel. NO auto-detect."""
+    name, ext = _split_ext(filename)
+    # Replace underscores and dots with spaces
+    name = re.sub(r"[_.]", " ", name).strip()
+
+    # Strip user-defined words at start
+    if strip_words:
+        for word in strip_words:
+            word = word.strip()
+            if not word: continue
+            name = re.sub(
+                r"^\s*" + re.escape(word) + r"\s*[-_]?\s*",
+                "", name, flags=re.IGNORECASE
+            ).strip()
+
+    # Strip [tags] at start
+    name = re.sub(r"^\s*\[[^\]]{1,30}\]\s*", "", name).strip()
+    # Strip @channel at start
+    name = re.sub(r"^\s*@\S+\s*[-]?\s*", "", name).strip()
+    # Clean extra spaces
+    name = re.sub(r"\s+", " ", name).strip()
+
+    log.info("Filename cleaned: %r → %r + %r", _split_ext(filename)[0], name, ext)
+    return name + ext
+
+
+def _get_media(message):
+    return message.document or message.video or message.audio or message.voice
+
+def _ensure_dir():
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+def _cleanup(*paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            try: os.remove(p)
+            except Exception as e: log.warning("Cleanup %s: %s", p, e)
+
+def _fmt_eta(s):
+    if s < 60: return f"{int(s)}s"
+    elif s < 3600: return f"{int(s//60)}m {int(s%60)}s"
+    else: return f"{int(s//3600)}h {int((s%3600)//60)}m"
+
 
 # ── Pyrogram ───────────────────────────────────────────────────
 
@@ -61,208 +304,6 @@ async def stop_pyro_client():
     global _pyro_client
     if _pyro_client and _pyro_client.is_connected:
         await _pyro_client.stop()
-
-# ── Quality scan patterns (used for fallback) ──────────────────
-
-QUALITY_SCAN = [
-    (r"\b4k\b|\b2160p\b",               "4K"),
-    (r"\b1080p\b",                       "1080p"),
-    (r"\b720p\b",                        "720p"),
-    (r"\b480p\b",                        "480p"),
-    (r"\b360p\b",                        "360p"),
-    (r"\b240p\b",                        "240p"),
-    (r"\bpre[\s\-_.]?dvd[\s\-_.]?rip\b","PreDVDRip"),
-    (r"\bpre[\s\-_.]?dvd\b",            "PreDVD"),
-    (r"\bweb[\s\-_.]?dl\b",             "WEB-DL"),
-    (r"\bweb[\s\-_.]?rip\b",            "WEBRip"),
-    (r"\bblu[\s\-_.]?ray\b|\bbdrip\b",  "BluRay"),
-    (r"\bhd[\s\-_.]?rip\b",             "HDRip"),
-    (r"\bhd[\s\-_.]?cam\b",             "HDCAM"),
-    (r"\bcam[\s\-_.]?rip\b",            "CAMRip"),
-    (r"\bdvd[\s\-_.]?rip\b",            "DVDRip"),
-    (r"\b\bhq\b",                        "HQ"),
-]
-
-LANG_PATTERNS = [
-    ("Tamil",      [r"\btamil\b", r"\btam\b", r"\btgl\b"]),
-    ("Telugu",     [r"\btelugu\b", r"\btel\b", r"\btelu\b"]),
-    ("Hindi",      [r"\bhindi\b", r"\bhin\b"]),
-    ("English",    [r"\benglish\b", r"\beng\b"]),
-    ("Malayalam",  [r"\bmalayalam\b", r"\bmal\b"]),
-    ("Kannada",    [r"\bkannada\b", r"\bkan\b"]),
-    ("Bengali",    [r"\bbengali\b", r"\bben\b"]),
-    ("Marathi",    [r"\bmarathi\b", r"\bmar\b"]),
-    ("Chinese",    [r"\bchinese\b", r"\bchi\b", r"\bchn\b"]),
-    ("Japanese",   [r"\bjapanese\b", r"\bjpn\b"]),
-    ("Korean",     [r"\bkorean\b", r"\bkor\b"]),
-]
-
-
-# ── Source caption parser ──────────────────────────────────────
-
-def parse_source_caption(caption: str) -> tuple[str, str]:
-    """
-    Extract Language + Quality from source channel caption.
-    Uses lang\\w* to handle typos: Langauge, Lang, Language etc.
-    Falls back to scanning full caption text for quality patterns.
-    """
-    if not caption:
-        return "", ""
-
-    languages = ""
-    quality   = ""
-
-    # Lines to skip
-    def is_promo_line(line: str) -> bool:
-        return bool(re.search(
-            r"(http[s]?://|fast\s+download|join\s*»|t\.me/|@\w+channel)",
-            line, re.IGNORECASE
-        ))
-
-    for line in caption.split("\n"):
-        stripped = line.strip()
-        if is_promo_line(stripped):
-            continue
-
-        # Match language — lang\w* catches Langauge, Language, Lang
-        lang_m = re.match(r"lang\w*\s*[:\-]\s*(.+)", stripped, re.IGNORECASE)
-        if lang_m and not languages:
-            raw = re.sub(r"#", "", lang_m.group(1)).strip()
-            parts = re.split(r"[,+&/\[\]|]+", raw)
-            langs = [p.strip().title() for p in parts
-                     if p.strip() and len(p.strip()) > 1]
-            languages = ", ".join(langs)
-            log.info("Caption lang: %r", languages)
-
-        # Match quality line
-        qual_m = re.match(r"quality\s*[:\-]\s*(.+)", stripped, re.IGNORECASE)
-        if qual_m and not quality:
-            quality = re.sub(r"#", "", qual_m.group(1)).strip()
-            log.info("Caption quality: %r", quality)
-
-    # ── Fallback: scan full caption for quality patterns ───────
-    if not quality:
-        scan_lines = [
-            l.strip() for l in caption.split("\n")
-            if not is_promo_line(l)
-        ]
-        scan_text = re.sub(r"[_.\-\+\[\]()]", " ", " ".join(scan_lines).lower())
-        for pat, val in QUALITY_SCAN:
-            if re.search(pat, scan_text, re.IGNORECASE):
-                quality = val
-                log.info("Fallback quality from caption text: %r", quality)
-                break
-
-    # ── Fallback: scan full caption for language patterns ─────
-    if not languages:
-        scan_lines = [
-            l.strip() for l in caption.split("\n")
-            if not is_promo_line(l)
-        ]
-        scan_text = re.sub(r"[_.\-\+\[\]()]", " ", " ".join(scan_lines).lower())
-        found = []
-        for lang, patterns in LANG_PATTERNS:
-            for pat in patterns:
-                if re.search(r"\b" + pat.strip(r"\b") + r"\b", scan_text, re.IGNORECASE):
-                    found.append(lang)
-                    break
-        if found:
-            languages = ", ".join(found)
-            log.info("Fallback lang from caption text: %r", languages)
-
-    return languages, quality
-
-
-# ── Caption builder ────────────────────────────────────────────
-
-def build_final_caption(new_name: str, languages: str, quality: str,
-                        custom_footer: str = "") -> str:
-    """
-    Default format:
-    {filename}
-
-    Language : {languages}
-    Quality : {quality}
-
-    {custom_footer}
-    """
-    parts = [f"<b>{new_name}</b>"]
-    if languages or quality:
-        parts.append("\n")
-        if languages: parts.append(f"\nLanguage : {languages}")
-        if quality:   parts.append(f"\nQuality : {quality}")
-    if custom_footer and custom_footer.strip():
-        parts.append(f"\n\n{custom_footer.strip()}")
-    return "".join(parts)
-
-
-def build_custom_caption(template: str, new_name: str, languages: str,
-                         quality: str, **kwargs) -> str:
-    """User's full custom template with placeholders."""
-    try:
-        result = template.format(
-            newname=new_name,
-            languages=languages or "—",
-            quality=quality or "—",
-            **kwargs
-        )
-        lines = result.split("\n")
-        cleaned = []
-        for line in lines:
-            if re.search(
-                r"(Language|Quality)\s*:\s*(—|--)?\s*$",
-                line.strip(), re.IGNORECASE
-            ):
-                continue
-            cleaned.append(line)
-        return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned)).strip()
-    except Exception:
-        return new_name
-
-
-# ── Filename cleaner ───────────────────────────────────────────
-
-def _split_ext(filename):
-    m = re.match(r"^(.*?)(\.[a-zA-Z0-9]{2,5})$", filename)
-    return (m.group(1), m.group(2)) if m else (filename, "")
-
-def clean_original_name(filename: str, strip_words: list[str] = None) -> str:
-    """Strip only manual strip_words + [tags] + @channel. NO auto-detect."""
-    name, ext = _split_ext(filename)
-    name = re.sub(r"[_.]", " ", name).strip()
-
-    if strip_words:
-        for word in strip_words:
-            word = word.strip()
-            if not word: continue
-            name = re.sub(
-                r"^\s*" + re.escape(word) + r"\s*[-_]?\s*",
-                "", name, flags=re.IGNORECASE
-            ).strip()
-
-    name = re.sub(r"^\s*\[[^\]]{1,30}\]\s*", "", name).strip()
-    name = re.sub(r"^\s*@\S+\s*[-]?\s*", "", name).strip()
-    name = re.sub(r"\s+", " ", name).strip()
-    log.info("Cleaned: %r → %r", _split_ext(filename)[0], name)
-    return name + ext
-
-
-def _get_media(message):
-    return message.document or message.video or message.audio or message.voice
-
-def _ensure_dir():
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-def _cleanup(*paths):
-    for p in paths:
-        if p and os.path.exists(p):
-            try: os.remove(p)
-            except Exception as e: log.warning("Cleanup %s: %s", p, e)
-
-def _fmt_eta(s):
-    if s < 60: return f"{int(s)}s"
-    elif s < 3600: return f"{int(s//60)}m {int(s%60)}s"
-    else: return f"{int(s//3600)}h {int((s%3600)//60)}m"
 
 
 # ── Progress tracker ───────────────────────────────────────────
@@ -362,21 +403,20 @@ async def _process_task(user, message, bot, pyro):
     prefix        = (user.get("file_prefix") or "").strip()
     strip_words   = [w.strip() for w in (user.get("strip_words") or "").split(",") if w.strip()]
 
-    # ── Extract Language + Quality from SOURCE CAPTION ─────────
+    # ── Extract from SOURCE CAPTION (primary) ─────────────────
     source_caption = message.caption or ""
-    src_languages, src_quality = parse_source_caption(source_caption)
+    src_languages, src_resolution = parse_source_caption(source_caption)
 
-    # Final fallback to filename if both empty
+    # Fallback to filename detection
     if not src_languages:
-        langs = extract_languages(original_name)
-        src_languages = ", ".join(langs) if langs else ""
-    if not src_quality:
-        src_quality = extract_quality(original_name)
+        src_languages = _extract_languages_from_text(original_name)
+    if not src_resolution:
+        src_resolution = _extract_resolution(original_name)
 
-    log.info("Final | lang=%r quality=%r | file=%s",
-             src_languages, src_quality, original_name)
+    log.info("Final | lang=%r resolution=%r | file=%s",
+             src_languages, src_resolution, original_name)
 
-    # ── Duplicate check ────────────────────────────────────────
+    # ── Duplicate check (10-min window) ───────────────────────
     if file_id and await is_duplicate(uid, file_id):
         log.info("Duplicate skipped | user=%s | %s", user["name"], original_name)
         await log_duplicate(bot, user, original_name)
@@ -384,7 +424,7 @@ async def _process_task(user, message, bot, pyro):
             await bot.send_message(chat_id=uid, parse_mode=ParseMode.HTML,
                 text=f"⏭ <b>Duplicate Skipped</b>\n\n"
                      f"<code>{original_name}</code>\n\n"
-                     f"ℹ️ Same file processed within last 10 minutes.")
+                     f"ℹ️ Same file within last 10 minutes.")
         except: pass
         return
 
@@ -398,7 +438,7 @@ async def _process_task(user, message, bot, pyro):
     thumb_dl_path  = None
     progress_msg   = None
 
-    # Register task
+    # Register task for /status
     task_id = _new_task_id()
     active_task_list[task_id] = {
         "user":    user["name"],
@@ -436,7 +476,8 @@ async def _process_task(user, message, bot, pyro):
                     speed   = current/elapsed if elapsed > 0 else 0
                     eta     = (total-current)/speed if speed > 0 else 0
                     active_task_list[_tid].update({
-                        "pct": pct, "speed": f"{human_size(int(speed))}/s",
+                        "pct": pct,
+                        "speed": f"{human_size(int(speed))}/s",
                         "eta": _fmt_eta(eta),
                     })
             tracker_dl.update = _patched
@@ -460,12 +501,13 @@ async def _process_task(user, message, bot, pyro):
         elif is_video(dl_path):
             thumb_dl_path = await extract_thumb_from_video(dl_path)
 
-        # Metadata
+        # Metadata title
         meta_title_tpl = user.get("metadata_title") or "{newname}"
         try:
             meta_title = meta_title_tpl.format(
                 newname=new_name, filename=original_name, name=name_no_ext,
-                prefix=prefix, languages=src_languages or "—", quality=src_quality)
+                prefix=prefix, languages=src_languages or "—",
+                quality=src_resolution)
         except: meta_title = new_name
 
         custom_meta = {
@@ -484,15 +526,15 @@ async def _process_task(user, message, bot, pyro):
         caption_tpl = user.get("caption_template") or ""
         if caption_tpl:
             caption = build_custom_caption(
-                caption_tpl, new_name, src_languages, src_quality,
+                caption_tpl, new_name, src_languages, src_resolution,
                 filename=original_name, name=name_no_ext,
                 ext=ext, prefix=prefix, size=human_size(file_size),
             )
         else:
             caption = build_final_caption(
-                new_name    = new_name,
-                languages   = src_languages,
-                quality     = src_quality,
+                new_name      = new_name,
+                languages     = src_languages,
+                resolution    = src_resolution,
                 custom_footer = "",
             )
 
@@ -515,13 +557,14 @@ async def _process_task(user, message, bot, pyro):
         state.stats["by_user"][user["name"]] = state.stats["by_user"].get(user["name"], 0) + 1
 
         await log_task_done(bot, user, new_name, human_size(file_size),
-                            src_languages, src_quality, thumb_dl_path)
+                            src_languages, src_resolution, thumb_dl_path)
 
-        done_lines = [f"✅ <b>Done!</b>\n\n<code>{new_name}</code>\n📦 {human_size(file_size)}"]
-        if src_languages: done_lines.append(f"\n🌐 {src_languages}")
-        if src_quality:   done_lines.append(f"\n📺 {src_quality}")
+        # Done message
+        done = [f"✅ <b>Done!</b>\n\n<code>{new_name}</code>\n📦 {human_size(file_size)}"]
+        if src_languages: done.append(f"\n🌐 {src_languages}")
+        if src_resolution: done.append(f"\n📺 {src_resolution}")
         if progress_msg:
-            await progress_msg.edit_text("".join(done_lines), parse_mode=ParseMode.HTML)
+            await progress_msg.edit_text("".join(done), parse_mode=ParseMode.HTML)
 
     except Exception as exc:
         log.error("Error | user=%s: %s", user["name"], exc)
@@ -610,7 +653,7 @@ def _build_status_text(page: int = 1) -> tuple[str, int]:
 
     try:
         import shutil
-        disk    = shutil.disk_usage(DOWNLOAD_DIR if os.path.exists(DOWNLOAD_DIR) else "/")
+        disk     = shutil.disk_usage(DOWNLOAD_DIR if os.path.exists(DOWNLOAD_DIR) else "/")
         disk_str = f"{disk.free/(1024**3):.2f} GB"
     except:
         disk_str = "—"
@@ -619,7 +662,7 @@ def _build_status_text(page: int = 1) -> tuple[str, int]:
         "📊 <b>LeechBot Status</b>\n",
         f"• Tasks : {total_act} active | {q_size} queued",
         f"• Done  : {state.stats['total']} | Failed: {state.stats['failed']}",
-        f"• Free Disk : {disk_str}",
+        f"• Free  : {disk_str}",
         f"• DL: {human_size(state.stats['downloaded'])} | UL: {human_size(state.stats['uploaded'])}",
         "",
     ]
@@ -630,7 +673,6 @@ def _build_status_text(page: int = 1) -> tuple[str, int]:
         start      = (page - 1) * TASKS_PER_PAGE
         end        = min(start + TASKS_PER_PAGE, total_act)
         page_tasks = tasks[start:end]
-
         for i, t in enumerate(page_tasks, start=start+1):
             elapsed    = time.time() - t["started"]
             name_short = t["filename"][:38] + ("…" if len(t["filename"]) > 38 else "")
