@@ -197,3 +197,140 @@ async def _embed_audio(inp, out, thumb, title, meta):
     code, err = await _run(cmd)
     if code != 0: log.error("ffmpeg audio: %s", err[:400]); return False
     return True
+
+
+# ── Admin Command Handlers ─────────────────────────────────────
+
+async def start_command(update, context):
+    user = update.effective_user
+    await update.message.reply_text(
+        f"👋 Hello {user.first_name}!\n\n"
+        f"I'm an Auto Renamer Bot.\n"
+        f"Send me a video or audio file and I'll rename it for you.\n\n"
+        f"Use /commands to see all available commands."
+    )
+
+async def commands_command(update, context):
+    await update.message.reply_text(
+        "📋 <b>Available Commands</b>\n\n"
+        "<b>Admin Commands:</b>\n"
+        "/adduser &lt;user_id&gt; - Add a user\n"
+        "/removeuser &lt;user_id&gt; - Remove a user\n"
+        "/listusers - List all users\n"
+        "/userinfo &lt;user_id&gt; - Get user info\n"
+        "/toggleuser &lt;user_id&gt; - Toggle user access\n"
+        "/stats - Bot statistics\n"
+        "/broadcast &lt;message&gt; - Broadcast to all users\n\n"
+        "<b>User Commands:</b>\n"
+        "/myinfo - Your info\n"
+        "/status - Queue status\n"
+        "/settings - Your settings",
+        parse_mode="HTML"
+    )
+
+async def adduser_command(update, context):
+    from config import ADMIN_IDS
+    from database import add_user
+    if update.effective_user.id not in ADMIN_IDS:
+        return await update.message.reply_text("❌ You are not an admin.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /adduser <user_id>")
+    try:
+        user_id = int(context.args[0])
+        await add_user(user_id)
+        await update.message.reply_text(f"✅ User {user_id} added successfully.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def removeuser_command(update, context):
+    from config import ADMIN_IDS
+    from database import remove_user
+    if update.effective_user.id not in ADMIN_IDS:
+        return await update.message.reply_text("❌ You are not an admin.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /removeuser <user_id>")
+    try:
+        user_id = int(context.args[0])
+        await remove_user(user_id)
+        await update.message.reply_text(f"✅ User {user_id} removed successfully.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def listusers_command(update, context):
+    from config import ADMIN_IDS
+    from database import all_users
+    if update.effective_user.id not in ADMIN_IDS:
+        return await update.message.reply_text("❌ You are not an admin.")
+    try:
+        users = await all_users()
+        if not users:
+            return await update.message.reply_text("No users found.")
+        text = "👥 <b>Users:</b>\n" + "\n".join([f"• <code>{u}</code>" for u in users])
+        await update.message.reply_text(text, parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def userinfo_command(update, context):
+    from config import ADMIN_IDS
+    from database import get_user
+    if update.effective_user.id not in ADMIN_IDS:
+        return await update.message.reply_text("❌ You are not an admin.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /userinfo <user_id>")
+    try:
+        user_id = int(context.args[0])
+        info = await get_user(user_id)
+        await update.message.reply_text(f"ℹ️ User info:\n<pre>{info}</pre>", parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def toggleuser_command(update, context):
+    from config import ADMIN_IDS
+    from database import toggle_user
+    if update.effective_user.id not in ADMIN_IDS:
+        return await update.message.reply_text("❌ You are not an admin.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /toggleuser <user_id>")
+    try:
+        user_id = int(context.args[0])
+        result = await toggle_user(user_id)
+        await update.message.reply_text(f"✅ User {user_id} access toggled. Status: {result}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def stats_command(update, context):
+    from config import ADMIN_IDS
+    from database import all_users
+    import state
+    if update.effective_user.id not in ADMIN_IDS:
+        return await update.message.reply_text("❌ You are not an admin.")
+    try:
+        users = await all_users()
+        total = state.stats.get("total", 0)
+        await update.message.reply_text(
+            f"📊 <b>Bot Statistics</b>\n\n"
+            f"👥 Total Users: {len(users)}\n"
+            f"📁 Files Processed: {total}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def broadcast_command(update, context):
+    from config import ADMIN_IDS
+    from database import all_users
+    if update.effective_user.id not in ADMIN_IDS:
+        return await update.message.reply_text("❌ You are not an admin.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /broadcast <message>")
+    msg = " ".join(context.args)
+    users = await all_users()
+    success, failed = 0, 0
+    for user_id in users:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=msg)
+            success += 1
+        except Exception:
+            failed += 1
+    await update.message.reply_text(f"✅ Broadcast done.\nSuccess: {success}\nFailed: {failed}")
+    
