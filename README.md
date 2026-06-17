@@ -178,7 +178,7 @@ auto-renamer/
 Made with ❤️ by **AskBotz**
 
 [![Telegram Channel](https://img.shields.io/badge/Join%20Channel-AskBotz-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/AskBotz)
-[![Telegram Admin](https://img.shields.io/badge/Contact%20Admin-@YourUsername-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/YourUsername)
+[![Telegram Admin](https://img.shields.io/badge/Contact%20Admin-@Master_xkid-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/Master_xkid)
 
 </div>
 
