@@ -375,7 +375,7 @@ async def _pyro_upload(pyro, message, dest_channel, file_path, new_name,
     else:
         await pyro.send_document(chat_id=dest_channel, document=file_path,
             caption=caption, file_name=new_name, thumb=thumb,
-            force_document=True, progress=prog)
+            progress=prog)
     state.stats["uploaded"] += size
     log.info("Uploaded: %s (%s)", new_name, human_size(size))
 
