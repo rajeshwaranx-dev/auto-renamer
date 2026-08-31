@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("leechbot")
 
-BOT_TOKEN    = os.getenv("BOT_TOKEN", "8361529441:AAGfl604PFp9OHLKyL8kcTnQoBTCo8oXAIg")
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "8361529441:AAGL0lmdJMTQs3QhxSLFCD-UKA1Qk9NVJKg")
 ADMIN_IDS    = [int(x) for x in os.getenv("ADMIN_IDS", "7246154050").split(",") if x.strip()]
 MONGO_URL    = os.getenv("MONGO_URL", "mongodb+srv://Askrss:Askrssx@cluster0.1mqswlh.mongodb.net/?appName=Cluster0")
 MONGO_DB     = os.getenv("MONGO_DB_NAME", "Askrss")
